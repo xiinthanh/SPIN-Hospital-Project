@@ -1,6 +1,6 @@
 #define TIME_LIMIT 480
 #define N_SUBJECTS 20
-#define N_CUSTOMER_MAX 200
+#define N_CUSTOMER_MAX 20
 
 #define N_OPERATING_ROOM 2
 
@@ -111,16 +111,10 @@ active proctype ClockTicking() {
             fi
 
             // Working over time: treatment takes longer than expected.
-            // TODO
             if 
-                :: isClosed && empty(customerEntrance) && empty(customerHallway) && nWaitingCustomer_DeptC == 0 -> {  // This is a temporary line should add Dept. A & B after complete them.
+                :: isClosed && _nr_pr == 1 -> {  // Stop when it is the only process left.
                     break;
                 }
-                :: else -> skip;
-            fi
-
-            if
-                :: globalTime == 800 -> break;
                 :: else -> skip;
             fi
         }
@@ -186,15 +180,16 @@ active proctype GateKeeper() {
     do
         :: {
             // Non-critical: Wait for the next customer.
-            customerEntrance ? processingCustomer;
+            if
+                :: customerEntrance ? processingCustomer -> skip;
+                :: isClosed && empty(customerEntrance) -> break;  // CLOSED.
+            fi
 
             // Checking customer takes randomly 1-5 minutes.
             select (processingTime: 1 .. 5);
 
             // Register to the ClockTicking.
             timeRegistration ! SUB, _pid;
-
-            printf("%d %d %d\n", globalTime, processingTime, len(customerEntrance));
 
 
             // Critical: checking customer's type & department.
@@ -221,7 +216,7 @@ active proctype GateKeeper() {
                                             customerHallway ! processingCustomer;
                                             nWaitingCustomer_DeptC++;
                                         }
-                                        :: else -> {
+                                        :: else -> {  // Reject
                                             isClosed_DeptC = true;
                                         }
                                     fi
@@ -269,6 +264,8 @@ active proctype HallWay() {
                     walkCus[index].minuteLeft = walkingTime;
 
                     index++;       
+
+                    assert(index < N_CUSTOMER_MAX);
                 }
                 :: empty(customerHallway) -> break;
             od
@@ -348,23 +345,19 @@ active proctype PreOPRoom() {
     bool isPreselected = false;
 
     do
-        :: isClosed && empty(deptQueue_C) && empty(deptVIPQueue_C) -> break;
-        :: !isClosed || nempty(deptQueue_C) || nempty(deptVIPQueue_C) -> {
+        :: {
             if
                 :: isPreselected -> skip;
                 :: else -> {
                     // Waiting for patient to enter.
                     if
-                        :: nempty(deptVIPQueue_C) -> {  // Prioritize VIP customer.
-                            deptVIPQueue_C ? preOPCustomerID;
+                        :: deptVIPQueue_C ? preOPCustomerID; -> {  // Select the next VIP customer.
                             preOPCustomerType = VIP;
                         }
-                        :: empty(deptVIPQueue_C) -> {
-                            if
-                                :: deptQueue_C ? preOPCustomerID, preOPCustomerType -> skip;  // Select the next customer in the queue.
-                                :: deptQueue_C ?? preOPCustomerID, INS -> skip;  // Select the next INS customer in the queue.
-                            fi
-                        }
+                        :: deptQueue_C ? preOPCustomerID, preOPCustomerType -> skip;  // Select the next customer in the queue.
+                        :: deptQueue_C ?? preOPCustomerID, INS -> skip;  // Select the next INS customer in the queue.
+
+                        :: isClosed && nWaitingCustomer_DeptC == 0 -> break;  // CLOSED.
                     fi
                 }
             fi
@@ -471,9 +464,8 @@ active[2] proctype OperatingRoom() {
     int operatingTime;
 
     do
-        :: isClosed_DeptC && nWaitingCustomer_DeptC == 0 -> break;
-        :: else -> {
-            // Wait for customer ready in Pre-OP room and this OP room to be CLEAN
+        :: {
+            // Wait for customer ready in Pre-OP room and this OP room to be CLEAN.
             atomic {
                 if
                     :: ( opRoom[opRoomId] == CLEAN ) && ( isPreOPReady == true ) -> {
@@ -481,6 +473,7 @@ active[2] proctype OperatingRoom() {
                         currentCustomerType = preOPCustomerType;
                         isPreOPReady = false;
                     }
+                    :: isClosed && nWaitingCustomer_DeptC == 0 -> break;  // CLOSED.
                 fi
             }
 
@@ -518,12 +511,14 @@ active proctype CleaningTeam() {
     int cleaningTime;
     int cleaningRoomId;
     do
-        :: isClosed_DeptC && nWaitingCustomer_DeptC == 0 -> break;
-        :: else -> {
-            // Wait for any of the two room to be DIRTY
+        :: {
+            // Wait for any of the two room to be DIRTY.
             if
                 :: opRoom[0] == DIRTY -> cleaningRoomId = 0;
                 :: opRoom[1] == DIRTY -> cleaningRoomId = 1;
+                :: isClosed && opRoom[0] != DIRTY && opRoom[1] != DIRTY && nWaitingCustomer_DeptC == 0 -> {  // CLOSED
+                    break;
+                }
             fi
 
             // Cleaning time is random from 5 to 10 minutes
