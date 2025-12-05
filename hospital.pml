@@ -13,17 +13,17 @@ mtype:department = { A, B, C };
 
 
 typedef Customer {
-    int id;
+    byte id;
     mtype:customerType type;
     mtype:department dept;
 }
 
 typedef WalkingCustomer {
     Customer customer;
-    int minuteLeft;
+    byte minuteLeft;
 }
 
-int customerUniversalId = 0;
+byte customerUniversalId = 0;
 
 int globalTime = 0;
 
@@ -50,27 +50,27 @@ Minimum cleaning time after each treatment: 5
 There are 2 OP Room => Maximum 2 treatments at a time.
 => Maximum [ 480 / (3+20+5) ] x 2 = 32.28 clients per day
 */
-chan deptQueue_C = [35] of { int, mtype:customerType };  // (customer id, customer type)
-chan deptVIPQueue_C = [35] of { int };  // (customer id)
+chan deptQueue_C = [10] of { byte, mtype:customerType };  // (customer id, customer type)
+chan deptVIPQueue_C = [10] of { byte };  // (customer id)
 
 mtype:opRoomState = { CLEAN, DIRTY, BUSY };
 
-int operatingRoomUniversalId = 0;
+byte operatingRoomUniversalId = 0;
 mtype:opRoomState opRoom[N_OPERATING_ROOM] = CLEAN;
 
-int preOPCustomerID = 0;
+byte preOPCustomerID = 0;
 mtype:customerType preOPCustomerType;
 bool isPreOPReady = false;
 
-int nWaitingCustomer_DeptC = 0;
+byte nWaitingCustomer_DeptC = 0;
 bool isClosed_DeptC = false;
 
 
 active proctype ClockTicking() {
     bool isSubscribed[N_SUBJECTS];
     mtype:messageType reqMsg;
-    int reqId;
-    int i;
+    byte reqId;
+    byte i;
 
     do 
         :: {
@@ -175,7 +175,7 @@ active[3] proctype CustomerEntranceQueue() {
 
 
 active proctype GateKeeper() {
-    int processingTime;
+    byte processingTime;
     Customer processingCustomer;
     do
         :: {
@@ -247,7 +247,7 @@ active proctype GateKeeper() {
 // Always countdown for every minutes.
 active proctype HallWay() {
     WalkingCustomer walkCus[N_CUSTOMER_MAX];
-    int index;
+    byte index;
     int i, j;
 
     timeRegistration ! SUB, _pid;
@@ -259,7 +259,7 @@ active proctype HallWay() {
                     customerHallway ? walkCus[index].customer;
 
                     // Walking time is randomly 1-5 minutes long.
-                    int walkingTime;
+                    byte walkingTime;
                     select (walkingTime: 1 .. 5);
                     walkCus[index].minuteLeft = walkingTime;
 
@@ -294,7 +294,7 @@ active proctype HallWay() {
                                             deptVIPQueue_C ! walkCus[i].customer.id;
                                         }
                                         :: else -> {  // INS + NORM
-                                            int tempId = walkCus[i].customer.id;
+                                            byte tempId = walkCus[i].customer.id;
                                             mtype:customerType tempType = walkCus[i].customer.type;
                                             deptQueue_C ! tempId, tempType;
                                         }
@@ -341,7 +341,7 @@ active proctype HallWay() {
 
 
 active proctype PreOPRoom() {
-    int preOPTime;
+    byte preOPTime;
     bool isPreselected = false;
 
     do
@@ -389,7 +389,7 @@ active proctype PreOPRoom() {
                         :: preOPCustomerType != VIP -> {
                             if 
                                 :: nempty(deptVIPQueue_C) -> {
-                                    int vipId;
+                                    byte vipId;
                                     deptVIPQueue_C ? vipId 
                                     
                                     // The current customer is kicked out of the Pre-OP room.
@@ -426,7 +426,7 @@ active proctype PreOPRoom() {
                                 :: preOPCustomerType != VIP -> {  
                                     if 
                                         :: nempty(deptVIPQueue_C) -> {
-                                            int vipId;
+                                            byte vipId;
                                             deptVIPQueue_C ? vipId 
                                             
                                             // The current customer is kicked out of the Pre-OP room.
@@ -453,15 +453,15 @@ active proctype PreOPRoom() {
 }
 
 active[2] proctype OperatingRoom() {
-    int opRoomId;
+    byte opRoomId;
     atomic {
         opRoomId = operatingRoomUniversalId;
         operatingRoomUniversalId++;
     }
 
-    int currentCustomerId;
+    byte currentCustomerId;
     mtype:customerType currentCustomerType;
-    int operatingTime;
+    byte operatingTime;
 
     do
         :: {
@@ -508,8 +508,8 @@ active[2] proctype OperatingRoom() {
 }
 
 active proctype CleaningTeam() {
-    int cleaningTime;
-    int cleaningRoomId;
+    byte cleaningTime;
+    byte cleaningRoomId;
     do
         :: {
             // Wait for any of the two room to be DIRTY.
