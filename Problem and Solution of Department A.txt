@@ -68,7 +68,6 @@ byte machineReservedBy[N_MACHINE_A] = 255;
 
 ✅ **VIP skips ahead**:
 - VIPs always taken first from queue
-- VIPs can interrupt ongoing non-VIP treatments
 - VIPs wait for other VIPs (respects queue order within VIP queue)
 
 ✅ **VIP doesn't skip other VIPs**:
@@ -81,24 +80,3 @@ byte machineReservedBy[N_MACHINE_A] = 255;
 - Doctors yield and retry if no resources available
 - No deadlock: machines always eventually freed
 
-### **5. Example Scenario**
-
-```
-Time 0: 
-- Doctor 1 reserves Machine A, treats Normal patient
-- Doctor 2 reserves Machine B, treats Insured patient  
-- Doctor 3 waits (no machines)
-
-Time 5:
-- VIP patient arrives
-- Doctor 1 is treating Normal (8 min left) → INTERRUPTED
-- Doctor 1 returns Normal to queue, releases Machine A
-- Doctor 3 (waiting) grabs Machine A, treats VIP
-- Doctor 2 continues treating Insured
-
-Time 15:
-- Doctor 3 finishes VIP, releases Machine A
-- Doctor 1 grabs Machine A, resumes treating returned Normal patient
-```
-
-This ensures fairness, priority enforcement, and no starvation!
