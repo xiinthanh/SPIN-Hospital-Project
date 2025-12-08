@@ -1,0 +1,53 @@
+
+### **Issue 1: Time Synchronization Design**
+**Problem:** Used fixed arrays indexed by `_pid`, which could cause out-of-bounds access if PIDs weren't contiguous.
+
+**Fix:** 
+- Changed to a dynamic subscriber list using channels
+- Subscribers register by sending their own channel to `timeRegistration`
+- Clock maintains an array of subscriber channels and broadcasts to them
+- Each process gets its own `myChan = [1] of { mtype:messageType }` for receiving ticks
+- No more dependency on PID values
+
+### **Issue 2: N_SUBJECTS Sizing**
+**Problem:** Array sizing assumed PIDs would fit within 20 slots.
+
+**Fix:**
+- Changed to `MAX_PROCESSES 15` to accurately reflect the actual process count
+- Using dynamic channel-based subscription eliminates fixed array bounds issues
+- Each process manages its own response channel
+
+### **Issue 3: Independent Closure Flags**
+**Problem:** Three separate flags (`isClosed`, `isClosed_DeptA`, `isClosed_DeptC`) created confusion.
+
+**Fix:**
+- Removed `isClosed_DeptA` and `isClosed_DeptC` entirely
+- Only use global `isClosed` flag (set at TIME_LIMIT)
+- GateKeeper checks `!isClosed` before admitting customers to any department
+- When `isClosed = true`, no new customers are admitted, but existing customers continue processing
+
+### **Issue 4: Admission Control Logic**
+**Problem:** Used sequential treatment time assumptions, ignoring parallel processing capabilities.
+
+**Fix:**
+- Added `avgParallelTreatmentTime_DeptA = 5` (15 minutes ÷ 3 doctors)
+- Added `avgParallelTreatmentTime_DeptC = 18` (36 minutes ÷ 2 operating rooms)
+- Admission control now uses these parallel times for more accurate capacity estimation
+- Formula: `globalTime <= TIME_LIMIT - (nWaiting + 1) * avgParallelTime`
+
+### **Issue 5: System Drainage**
+**Your Intent:** Stop generating/accepting new customers at TIME_LIMIT, but serve all remaining customers.
+
+**Fix:**
+- `isClosed = true` stops customer generation (CustomerEntranceQueue exits)
+- GateKeeper processes remaining customers in `customerEntrance` channel, but rejects new admissions after `isClosed`
+- Added tracking: `nProcessingCustomer_DeptA` and `nProcessingCustomer_DeptC` to count customers actively being treated
+- ClockTicking only stops when: `isClosed && nWaiting == 0 && nProcessing == 0 && nSubscribers == 0`
+- All department processes check for closure + empty queues before exiting
+- This ensures the system gracefully drains all customers before terminating
+
+### **Additional Fixes:**
+- Fixed peek bug in DoctorA: Changed `deptQueue_A ?? patientId, INS` to `deptQueue_A ? patientId, INS`
+- Fixed similar peek bug in PreOPRoom for INS customers
+- Added proper state checking before treatment loops to avoid working with uninitialized data
+- All processes now have proper exit conditions considering both closure and work completion
