@@ -1,0 +1,104 @@
+Overview: Ensure the system handles three doctors but only two machines. The doctors must share the machines effectively to ensure that no doctor remains idle for the entire day and that waiting times are not excessive.
+
+Priority Logic: VIP patients must be prioritized over all other patient types. VIP patients will wait for other VIPs who are already in the queue, but they should skip ahead of any non-VIP patients.
+
+Operational Constraints: For example, a doctor requires a machine to operate in this department. If both machines are already occupied, the third doctor must wait. You must ensure the system does not freeze (avoiding deadlocks) and strictly follows the rules: VIPs always skip ahead of other types but never skip ahead of other VIPs.
+
+Solution:
+
+### **1. Three Separate Queues by Priority**
+```promela
+chan deptNormQueue_A = [10] of { byte };   // Normal customers
+chan deptInsQueue_A = [10] of { byte };    // Insured customers  
+chan deptVIPQueue_A = [10] of { byte };    // VIP customers
+```
+**Why**: Clear separation makes priority enforcement simple and efficient. No need for peeking or scanning.
+
+### **2. Machine Reservation System**
+```promela
+bool machineReserved[N_MACHINE_A] = false;
+byte machineReservedBy[N_MACHINE_A] = 255;
+```
+**Why**: Prevents race conditions where multiple doctors try to grab the same machine. Each doctor reserves a specific machine ID, ensuring fairness.
+
+### **3. Three-Phase Doctor Process**
+
+**Phase 1: Reserve a Machine**
+- Doctor tries to atomically reserve any available machine
+- If no machines available, doctor waits (doesn't freeze - just loops back)
+- Reservation prevents conflicts between 3 doctors competing for 2 machines
+
+**Phase 2: Get Patient with Strict Priority**
+- Once machine is reserved, doctor checks queues in order:
+  1. VIP queue (always first)
+  2. Insured queue (if no VIPs)
+  3. Normal queue (if no VIPs or Insured)
+- If no patients, doctor releases the machine and tries again
+- **This ensures no doctor holds a machine while idle**
+
+**Phase 3: Treat Patient**
+- Doctor treats patient for 10-20 minutes
+- **VIP Interruption**: During treatment, if a VIP arrives AND current patient is not VIP:
+  - Doctor stops treatment (if more than 2 minutes remaining)
+  - Returns current patient to their queue
+  - Releases machine
+  - Loops back to grab the VIP next
+  
+```promela
+:: pType != VIP && treatTime > 2 && nempty(deptVIPQueue_A) -> {
+    // Return patient to queue
+    if
+        :: pType == INS -> deptInsQueue_A ! patientId;
+        :: pType == NORM -> deptNormQueue_A ! patientId;
+    fi
+    // Release machine and restart
+}
+```
+
+### **4. How Requirements Are Met**
+
+✅ **3 doctors, 2 machines, alternate work**: 
+- Doctors compete fairly for machines via reservation
+- When 2 machines busy, 3rd doctor waits but doesn't freeze
+- As soon as a machine frees, waiting doctor grabs it
+
+✅ **No doctor idle all day**:
+- Doctors only release machine if there are NO patients
+- As long as patients exist, doctors continuously work
+
+✅ **VIP skips ahead**:
+- VIPs always taken first from queue
+- VIPs can interrupt ongoing non-VIP treatments
+- VIPs wait for other VIPs (respects queue order within VIP queue)
+
+✅ **VIP doesn't skip other VIPs**:
+- VIP queue is FIFO
+- When doctor checks `nempty(deptVIPQueue_A)`, it takes the HEAD of VIP queue
+- VIP behind another VIP must wait
+
+✅ **System doesn't freeze**:
+- Atomic blocks prevent race conditions
+- Doctors yield and retry if no resources available
+- No deadlock: machines always eventually freed
+
+### **5. Example Scenario**
+
+```
+Time 0: 
+- Doctor 1 reserves Machine A, treats Normal patient
+- Doctor 2 reserves Machine B, treats Insured patient  
+- Doctor 3 waits (no machines)
+
+Time 5:
+- VIP patient arrives
+- Doctor 1 is treating Normal (8 min left) → INTERRUPTED
+- Doctor 1 returns Normal to queue, releases Machine A
+- Doctor 3 (waiting) grabs Machine A, treats VIP
+- Doctor 2 continues treating Insured
+
+Time 15:
+- Doctor 3 finishes VIP, releases Machine A
+- Doctor 1 grabs Machine A, resumes treating returned Normal patient
+```
+
+This ensures fairness, priority enforcement, and no starvation!
