@@ -322,7 +322,9 @@ active proctype HallWay() {
                                             deptVIPQueue_A ! walkCus[i].customer.id;
                                         }
                                         :: else -> {
-                                            deptQueue_A ! walkCus[i].customer.id, walkCus[i].customer.type;
+                                            byte tempId = walkCus[i].customer.id;
+                                            mtype:customerType tempCustomerType = walkCus[i].customer.type; 
+                                            deptQueue_A ! tempId, tempCustomerType;
                                         }
                                     fi
                                 }
@@ -613,106 +615,121 @@ active proctype DeptB_Senior() {
 // --- PROCESS: DEPARTMENT C PRE-OP ---
 active proctype PreOPRoom() {
     chan myChan = [1] of { mtype:messageType };
+    
     byte preOPTime;
+    bool isPreselected = false;
 
     do
         :: {
             if
-                :: isClosed && nWaitingCustomer_DeptC == 0 &&
-                   empty(deptVIPQueue_C) && empty(deptQueue_C) -> break;
-                :: else -> skip;
+                :: isPreselected -> skip;
+                :: else -> {
+                    // Waiting for patient to enter.
+                    if
+                        :: deptVIPQueue_C ? preOPCustomerID; -> {  // Select the next VIP customer.
+                            preOPCustomerType = VIP;
+                        }
+                        :: deptQueue_C ? preOPCustomerID, preOPCustomerType -> skip;  // Select the next customer in the queue.
+                        :: deptQueue_C ?? preOPCustomerID, INS -> skip;  // Select the next INS customer in the queue.
+
+                        :: isClosed && nWaitingCustomer_DeptC == 0 -> break;  // CLOSED.
+                    fi
+                }
             fi
+            isPreselected = false;
+            // Staying time is randomly selected from 3-5 minutes.
+            select (preOPTime: 3 .. 5);
+        
+            // Begin the countdown. 
+            timeRegistration ! SUB, myChan;
 
-            // Select patient
-            if
-                :: nempty(deptVIPQueue_C) -> {
-                    deptVIPQueue_C ? preOPCustomerID;
-                    preOPCustomerType = VIP;
-                    nWaitingCustomer_DeptC--;
-                }
-                :: empty(deptVIPQueue_C) && deptQueue_C ?? [preOPCustomerID, INS] -> {
-                    deptQueue_C ? preOPCustomerID, INS;  // FIXED: Proper receive
-                    preOPCustomerType = INS;
-                    nWaitingCustomer_DeptC--;
-                }
-                :: empty(deptVIPQueue_C) && !deptQueue_C ?? [preOPCustomerID, INS] && 
-                   nempty(deptQueue_C) -> {
-                    deptQueue_C ? preOPCustomerID, preOPCustomerType;
-                    nWaitingCustomer_DeptC--;
-                }
-                :: else -> skip;  // No patient available
-            fi
+            do
+                :: myChan ? TICK -> {
+                    preOPTime--;
+                    if
+                        :: preOPTime == 0 -> {
+                            // Done => Ready for Operating Room.
+                            isPreOPReady = true;
 
-            // Only proceed if we got a patient
-            if
-                :: preOPCustomerType == VIP || preOPCustomerType == INS || 
-                   preOPCustomerType == NORM -> {
-                    select (preOPTime: 3 .. 5);
-                    nProcessingCustomer_DeptC++;
-                    timeRegistration ! SUB, myChan;
+                            // Unregister to the ClockTicking.
+                            timeRegistration ! UNSUB, myChan;
+                            myChan ! ACK;
+                            break;
+                        }
+                        :: else -> skip;
+                    fi
 
-                    do
-                        :: globalTick ? TICK -> {
-                            preOPTime--;
-                            if
-                                :: preOPTime == 0 -> {
-                                    isPreOPReady = true;
+                    // Check if the current customer is kicked out or not.
+                    if
+                        :: preOPCustomerType != VIP -> {
+                            if 
+                                :: nempty(deptVIPQueue_C) -> {
+                                    byte vipId;
+                                    deptVIPQueue_C ? vipId 
+                                    
+                                    // The current customer is kicked out of the Pre-OP room.
+                                    deptQueue_C ! preOPCustomerID, preOPCustomerType;  // Requeue the current customer.
+                                    
+                                    // The next customer is a VIP.
+                                    isPreselected = true;
+                                    preOPCustomerID = vipId;
+                                    preOPCustomerType = VIP;
+                                    
+                                    // End the countdown.
                                     timeRegistration ! UNSUB, myChan;
                                     myChan ! ACK;
                                     break;
                                 }
-                                :: else -> skip;
-                            fi
-
-                            // Kick logic for VIP
-                            if
-                                :: preOPCustomerType != VIP && nempty(deptVIPQueue_C) -> {
-                                    byte vipId;
-                                    deptVIPQueue_C ? vipId;
-                                    // Kick current back
-                                    deptQueue_C ! preOPCustomerID, preOPCustomerType;
-                                    nWaitingCustomer_DeptC++;
-                                    // Accept VIP
-                                    preOPCustomerID = vipId;
-                                    preOPCustomerType = VIP;
-                                    preOPTime = 0;  // Restart prep for VIP
-                                }
-                                :: else -> skip;
-                            fi
-                            myChan ! ACK;
-                        }
-                    od
-
-                    // Wait for OR to pick up patient
-                    do
-                        :: !isPreOPReady -> break;
-                        :: isPreOPReady -> {
-                            // Can still be kicked while waiting
-                            if
-                                :: preOPCustomerType != VIP && nempty(deptVIPQueue_C) -> {
-                                    byte vipId;
-                                    deptVIPQueue_C ? vipId;
-                                    deptQueue_C ! preOPCustomerID, preOPCustomerType;
-                                    nWaitingCustomer_DeptC++;
-                                    preOPCustomerID = vipId;
-                                    preOPCustomerType = VIP;
-                                    isPreOPReady = false;
-                                    break;
-                                }
-                                :: else -> skip;
+                                :: empty(deptVIPQueue_C) -> skip;  // There is no VIP atm.
                             fi
                         }
-                    od
+                        :: else -> skip;  // VIP cannot be kicked.
+                    fi
+
+                    myChan ! ACK;
                 }
-                :: else -> skip;
-            fi
+            od
+
+            // Waiting for Operating Room, but there is still a risk of being kicked out.
+            do
+                :: atomic {
+                    if
+                        :: !isPreOPReady -> break;  // Not waiting anymore.
+                        :: isPreOPReady -> {
+                            // Check if the current customer is kicked out or not.
+                            if
+                                :: preOPCustomerType != VIP -> {  
+                                    if 
+                                        :: nempty(deptVIPQueue_C) -> {
+                                            byte vipId;
+                                            deptVIPQueue_C ? vipId 
+                                            
+                                            // The current customer is kicked out of the Pre-OP room.
+                                            deptQueue_C ! preOPCustomerID, preOPCustomerType;  // Requeue the current customer.
+                                            
+                                            // The next customer is a VIP.
+                                            isPreselected = true;
+                                            preOPCustomerID = vipId;
+                                            preOPCustomerType = VIP;
+
+                                            isPreOPReady = false;
+                                        }
+                                        :: empty(deptVIPQueue_C) -> skip;  // There is no VIP atm.
+                                    fi
+                                }
+                                :: else -> skip;  // VIP cannot be kicked.
+                            fi
+                        }
+                    fi
+                } 
+            od
         }
     od
 }
 
-// --- PROCESS: DEPARTMENT C OPERATING ROOM ---
 active[2] proctype OperatingRoom() {
-    chan myChan = [1] of { mtype:messageType };
+    chan myChan = [1] of { mtype:messageType }; 
+
     byte opRoomId;
     atomic {
         opRoomId = operatingRoomUniversalId;
@@ -722,29 +739,27 @@ active[2] proctype OperatingRoom() {
     byte currentCustomerId;
     mtype:customerType currentCustomerType;
     byte operatingTime;
-    byte operatingTimeSave;
 
     do
         :: {
+            // Wait for customer ready in Pre-OP room and this OP room to be CLEAN.
             atomic {
                 if
-                    :: opRoom[opRoomId] == CLEAN && isPreOPReady -> {
+                    :: ( opRoom[opRoomId] == CLEAN ) && ( isPreOPReady == true ) -> {
                         currentCustomerId = preOPCustomerID;
                         currentCustomerType = preOPCustomerType;
                         isPreOPReady = false;
-                        opRoom[opRoomId] = BUSY;
                     }
-                    :: isClosed && nProcessingCustomer_DeptC == 0 && !isPreOPReady -> break;
+                    :: isClosed && nWaitingCustomer_DeptC == 0 -> break;  // CLOSED.
                 fi
             }
 
             // Surgery time is random from 20 to 30.
             select (operatingTime: 20 .. 30);
-            operatingTimeSave = operatingTime;
 
             // Start the countdown: performing surgery.
             opRoom[opRoomId] = BUSY;
-            timeRegistration ! SUB, _pid;
+            timeRegistration ! SUB, myChan;
             do
                 :: myChan ? TICK -> {
                     operatingTime--;
@@ -752,9 +767,7 @@ active[2] proctype OperatingRoom() {
                         :: operatingTime == 0 -> { 
                             // Surgery completed.
                             opRoom[opRoomId] = DIRTY;
-                            nProcessingCustomer_DeptC--;
-
-                            printf("\nC - Customer with id %d is treated in %d minutes.\n", currentCustomerId, operatingTimeSave);
+                            nWaitingCustomer_DeptC--;
                             
                             // Unregister to the ClockTicking.
                             timeRegistration ! UNSUB, myChan;
@@ -766,24 +779,24 @@ active[2] proctype OperatingRoom() {
 
                     myChan ! ACK;
                 }
-            fi
+            od
         }
     od
 }
 
-// --- PROCESS: DEPARTMENT C CLEANING TEAM ---
 active proctype CleaningTeam() {
     chan myChan = [1] of { mtype:messageType };
     byte cleaningTime;
     byte cleaningRoomId;
-    
     do
         :: {
+            // Wait for any of the two room to be DIRTY.
             if
                 :: opRoom[0] == DIRTY -> cleaningRoomId = 0;
                 :: opRoom[1] == DIRTY -> cleaningRoomId = 1;
-                :: isClosed && opRoom[0] != DIRTY && opRoom[1] != DIRTY && 
-                   nProcessingCustomer_DeptC == 0 -> break;
+                :: isClosed && opRoom[0] != DIRTY && opRoom[1] != DIRTY && nWaitingCustomer_DeptC == 0 -> {  // CLOSED
+                    break;
+                }
             fi
 
             // Cleaning time is random from 5 to 10 minutes
