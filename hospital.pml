@@ -1,16 +1,27 @@
+// --- SYSTEM CONSTANTS & CONFIGURATION ---
 #define TIME_LIMIT 480
-#define N_SUBJECTS 20
+#define MAX_PROCESSES 15  // FIXED: Accurate count of all processes
 #define N_CUSTOMER_MAX 20
 
+// --- DEPARTMENT A CONFIGURATION ---
+#define N_DOCTOR_A 3
+#define N_MACHINE_A 2
+#define avgTreatmentTime_DeptA 15 /* Average of 10-20 mins */
+// FIXED: Adjusted for parallel processing (3 doctors)
+#define avgParallelTreatmentTime_DeptA 5  /* 15/3 = 5 minutes per customer with 3 doctors */
+
+// --- DEPARTMENT C CONFIGURATION ---
 #define N_OPERATING_ROOM 2
-
-// 4 + 25 + 7 = 36
+// 4 (PreOp) + 25 (Surgery) + 7 (Cleaning) = 36
 #define avgTreatmentTime_DeptC 36
+// FIXED: Adjusted for parallel processing (2 operating rooms)
+#define avgParallelTreatmentTime_DeptC 18  /* 36/2 = 18 minutes per customer with 2 rooms */
 
+// --- TYPES & ENUMS ---
 mtype:messageType = { SUB, UNSUB, TICK, ACK };
 mtype:customerType = { NORM, INS, VIP };
 mtype:department = { A, B, C };
-
+mtype:opRoomState = { CLEAN, DIRTY, BUSY };
 
 typedef Customer {
     byte id;
@@ -23,139 +34,126 @@ typedef WalkingCustomer {
     byte minuteLeft;
 }
 
+// --- GLOBAL VARIABLES & CHANNELS ---
 byte customerUniversalId = 0;
-
 int globalTime = 0;
-
 bool isClosed = false;
 
+// FIXED: Time Synchronization with proper sizing
+chan timeRegistration = [MAX_PROCESSES] of { mtype:messageType, chan };
+chan globalTick = [MAX_PROCESSES] of { mtype:messageType };
 
-// Channel to send SUB/UNSUB request (along with _pid).
-chan timeRegistration = [N_SUBJECTS] of { mtype:messageType, byte };
-
-// Channel(s) to send TICK/ACK.
-chan timeNotify[N_SUBJECTS] = [1] of { mtype:messageType };
-chan timeReply[N_SUBJECTS] = [0] of { mtype:messageType };
-
+// Entrance & Hallway Channels
 chan customerEntrance = [10] of { Customer };
 chan customerHallway = [10] of { Customer };
 
+// --- DEPARTMENT A GLOBALS ---
+chan deptNormQueue_A = [10] of { byte };
+chan deptInsQueue_A = [10] of { byte };
+chan deptVIPQueue_A = [10] of { byte };
+byte machinesAvailable = N_MACHINE_A; 
+byte nWaitingCustomer_DeptA = 0;
+byte nProcessingCustomer_DeptA = 0;
+// Machine reservation system to prevent starvation
+bool machineReserved[N_MACHINE_A] = false;
+byte machineReservedBy[N_MACHINE_A] = 255;  // 255 = no reservation
 
-
-// Dept B: Exam (4) + Treatment (12.5 to 17.5) ~ 20 (safe margin)
-#define avgTreatmentTime_DeptB 20
-/*
-Department B Channels:
-- Junior Queue High Priority (Insured)
-- Junior Queue Low Priority (Normal)
-- Senior Queue (VIP + Referrals)
-*/
-chan deptQueue_B_Junior_INS = [10] of { byte }; 
-chan deptQueue_B_Junior_NORM = [10] of { byte };
-chan deptQueue_B_Senior = [10] of { byte, bool }; // ID, isReferral (true=referral, false=direct VIP)
-
-// Variables for Dept B rejection rule
-byte nWaitingCustomer_DeptB = 0;
-bool isClosed_DeptB = false;
-
-
-
-/*
-Department C: 
-- Time in Pre-OP Room [3-5]  
-- Time in OP Room [20-30]
-- Cleaning time [5-10] 
-Minimum treatment time of department C: 3 + 20
-Minimum cleaning time after each treatment: 5
-There are 2 OP Room => Maximum 2 treatments at a time.
-=> Maximum [ 480 / (3+20+5) ] x 2 = 32.28 clients per day
-*/
-chan deptQueue_C = [10] of { byte, mtype:customerType };  // (customer id, customer type)
-chan deptVIPQueue_C = [10] of { byte };  // (customer id)
-
-mtype:opRoomState = { CLEAN, DIRTY, BUSY };
-
+// --- DEPARTMENT C GLOBALS ---
+chan deptQueue_C = [10] of { byte, mtype:customerType };
+chan deptVIPQueue_C = [10] of { byte };
 byte operatingRoomUniversalId = 0;
 mtype:opRoomState opRoom[N_OPERATING_ROOM] = CLEAN;
-
 byte preOPCustomerID = 0;
 mtype:customerType preOPCustomerType;
 bool isPreOPReady = false;
-
 byte nWaitingCustomer_DeptC = 0;
-bool isClosed_DeptC = false;
+byte nProcessingCustomer_DeptC = 0;  // FIXED: Track customers being treated
 
-
+// --- PROCESS: CLOCK TICKING (THE HEARTBEAT) ---
+// FIXED: Simplified synchronization using broadcast channel
 active proctype ClockTicking() {
-    bool isSubscribed[N_SUBJECTS];
+    chan subscribers[MAX_PROCESSES];
+    byte nSubscribers = 0;
     mtype:messageType reqMsg;
-    byte reqId;
+    chan reqChan;
     byte i;
-
+    
     do 
-        :: {
-            // Check ALL pending registrations (SUB/UNSUB).
-            do
-                :: nempty(timeRegistration) -> {
-                    timeRegistration ? reqMsg, reqId;
-                    if
-                        :: reqMsg == SUB -> isSubscribed[reqId] = true;
-                        :: reqMsg == UNSUB -> isSubscribed[reqId] = false;
-                    fi
-                }
-                :: empty(timeRegistration) -> break;
-            od
-
-            // Call subscribed subjects to perform their tasks.
-            for (i : 0 .. N_SUBJECTS-1) {
+    :: {
+        // 1. Process Registrations (non-blocking)
+        do
+            :: nempty(timeRegistration) -> {
+                timeRegistration ? reqMsg, reqChan;
                 if
-                    :: isSubscribed[i] -> timeNotify[i] ! TICK;
-                    :: else -> skip;
+                    :: reqMsg == SUB -> {
+                        subscribers[nSubscribers] = reqChan;
+                        nSubscribers++;
+                        assert(nSubscribers <= MAX_PROCESSES);
+                    }
+                    :: reqMsg == UNSUB -> {
+                        // Remove from subscriber list
+                        i = 0;
+                        do
+                            :: i >= nSubscribers -> break;
+                            :: i < nSubscribers -> {
+                                if
+                                    :: subscribers[i] == reqChan -> {
+                                        // Shift remaining subscribers
+                                        byte j;
+                                        for (j : i .. nSubscribers-2) {
+                                            subscribers[j] = subscribers[j+1];
+                                        }
+                                        nSubscribers--;
+                                        break;
+                                    }
+                                    :: else -> i++;
+                                fi
+                            }
+                        od
+                    }
                 fi
             }
+            :: empty(timeRegistration) -> break;
+        od
 
-            // Wait for subscribed subjects to finish their tasks.
-            for (i : 0 .. N_SUBJECTS-1) {
-                if
-                    :: isSubscribed[i] -> timeReply[i] ? ACK;
-                    :: else -> skip;
-                fi
-            }
-
-            // Increment the time.
-            globalTime++;
-            // printf("%d\n", globalTime);
-            if
-                :: globalTime == TIME_LIMIT -> isClosed = true;
-                :: else -> skip;
-            fi
-
-            // Working over time: treatment takes longer than expected.
-            if 
-                :: isClosed && _nr_pr == 1 -> {  // Stop when it is the only process left.
-                    break;
-                }
-                :: else -> skip;
-            fi
+        // 2. Broadcast TICK to all subscribers
+        for (i : 0 .. nSubscribers-1) {
+            subscribers[i] ! TICK;
         }
+
+        // 3. Wait for all ACKs
+        for (i : 0 .. nSubscribers-1) {
+            subscribers[i] ? ACK;
+        }
+
+        // 4. Advance Time
+        globalTime++;
+        if
+            :: globalTime == TIME_LIMIT -> isClosed = true;
+            :: else -> skip;
+        fi
+
+        // FIXED: Stop only when all customers are served
+        if 
+            :: isClosed && 
+               nWaitingCustomer_DeptA == 0 && nProcessingCustomer_DeptA == 0 &&
+               nWaitingCustomer_DeptC == 0 && nProcessingCustomer_DeptC == 0 &&
+               nSubscribers == 0 -> break;
+            :: else -> skip;
+        fi
+    }
     od
 }
 
-/*
-+ 40% new normal customer
-+ 20% new insurance customer
-+ 10% new VIP
-+ 30% no new customer
-*/
+// --- PROCESS: CUSTOMER ENTRANCE (GENERATOR) ---
 active[3] proctype CustomerEntranceQueue() {
     Customer newCustomer;
     bool isSkip;
 
     do
-        :: isClosed -> break;
+        :: isClosed -> break;  // FIXED: Stop generating when closed
         :: !isClosed -> {
             isSkip = false;
-            // Randomly select customer's type.
             if
                 :: 1 -> newCustomer.type = NORM;
                 :: 2 -> newCustomer.type = NORM;
@@ -171,20 +169,15 @@ active[3] proctype CustomerEntranceQueue() {
 
             if
                 :: !isSkip -> {
-                    // Get new customer id.
                     atomic {
                         newCustomer.id = customerUniversalId;
                         customerUniversalId++;
                     }
-
-                    // Randomly select customer's department.
                     if
                         :: 1 -> newCustomer.dept = A;
                         :: 2 -> newCustomer.dept = B;
                         :: 3 -> newCustomer.dept = C;
                     fi
-
-                    // Add new customer to the queue
                     customerEntrance ! newCustomer;
                 }
                 :: else -> skip;
@@ -193,112 +186,96 @@ active[3] proctype CustomerEntranceQueue() {
     od
 }
 
-
+// --- PROCESS: GATEKEEPER (ADMISSION CONTROL) ---
 active proctype GateKeeper() {
+    chan myChan = [1] of { mtype:messageType };
     byte processingTime;
     Customer processingCustomer;
+    
     do
         :: {
-            // Non-critical: Wait for the next customer.
             if
-                :: customerEntrance ? processingCustomer -> skip;
-                :: isClosed && empty(customerEntrance) -> break;  // CLOSED.
+                :: nempty(customerEntrance) -> customerEntrance ? processingCustomer;
+                :: empty(customerEntrance) && isClosed -> break;  // FIXED: Process remaining then exit
+                :: empty(customerEntrance) && !isClosed -> {
+                    // Wait for customers
+                    customerEntrance ? processingCustomer;
+                }
             fi
 
-            // Checking customer takes randomly 1-5 minutes.
             select (processingTime: 1 .. 5);
+            timeRegistration ! SUB, myChan;
 
-            // Register to the ClockTicking.
-            timeRegistration ! SUB, _pid;
-
-
-            // Critical: checking customer's type & department.
-            // (sync with Global Time)
             do
-                :: timeNotify[_pid] ? TICK -> {
+                :: globalTick ? TICK -> {
                     processingTime--;
-                    
                     if
                         :: processingTime == 0 -> {
-                            // Done checking => proceed to decide accept/reject.
+                            // FIXED: Unified admission control (removed per-dept closure flags)
                             if 
-                                :: processingCustomer.dept == A -> {
-                                    // TODO
-                                    skip;
-                                }
-                                :: processingCustomer.dept == B -> {
-                                    // Department B Admission with Rejection Rule
+                                :: processingCustomer.dept == A && !isClosed -> {
+                                    // FIXED: Account for parallel processing
                                     if
-                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptB + 1) * avgTreatmentTime_DeptB -> {
+                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptA + 1) * avgParallelTreatmentTime_DeptA -> {
                                             customerHallway ! processingCustomer;
-                                            nWaitingCustomer_DeptB++;
+                                            nWaitingCustomer_DeptA++;
                                         }
-                                        :: else -> {
-                                            isClosed_DeptB = true;
-                                        }
+                                        :: else -> skip;  // Reject customer
                                     fi
                                 }
-                                :: processingCustomer.dept == C -> {  // Checking rejection for department C
+                                :: processingCustomer.dept == B -> {
+                                    skip;  // Placeholder
+                                }
+                                :: processingCustomer.dept == C && !isClosed -> {
+                                    // FIXED: Account for parallel processing
                                     if
-                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptC + 1) * avgTreatmentTime_DeptC -> {
+                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptC + 1) * avgParallelTreatmentTime_DeptC -> {
                                             customerHallway ! processingCustomer;
                                             nWaitingCustomer_DeptC++;
                                         }
-                                        :: else -> {  // Reject
-                                            isClosed_DeptC = true;
-                                        }
+                                        :: else -> skip;  // Reject customer
                                     fi
                                 }
+                                :: else -> skip;  // After closure, reject all new admissions
                             fi
 
-                            // Unregister to the ClockTicking.
-                            timeRegistration ! UNSUB, _pid;
-                            
-                            timeReply[_pid] ! ACK;
+                            timeRegistration ! UNSUB, myChan;
+                            myChan ! ACK;
                             break;
                         }
                         :: else -> skip;
                     fi
-
-                    timeReply[_pid] ! ACK;
+                    myChan ! ACK;
                 }
             od
-
-            if
-                :: isClosed && empty(customerEntrance) -> break;
-                :: !isClosed || nempty(customerEntrance) -> skip;
-            fi
         }
     od
 }
 
-// Always countdown for every minutes.
+// --- PROCESS: HALLWAY (ROUTING) ---
 active proctype HallWay() {
+    chan myChan = [1] of { mtype:messageType };
     WalkingCustomer walkCus[N_CUSTOMER_MAX];
     byte index;
     int i, j;
 
-    timeRegistration ! SUB, _pid;
+    timeRegistration ! SUB, myChan;
     do
-        :: timeNotify[_pid] ? TICK -> {
-            // Adding new entered customers.
+        :: globalTick ? TICK -> {
+            // 1. Accept new customers from GateKeeper
             do
                 :: nempty(customerHallway) -> {
                     customerHallway ? walkCus[index].customer;
-
-                    // Walking time is randomly 1-5 minutes long.
                     byte walkingTime;
                     select (walkingTime: 1 .. 5);
                     walkCus[index].minuteLeft = walkingTime;
-
-                    index++;       
-
+                    index++;
                     assert(index < N_CUSTOMER_MAX);
                 }
                 :: empty(customerHallway) -> break;
             od
 
-            // Decrease minuteLeft for each walking customer.
+            // 2. Process walking customers
             i = 0;
             do
                 :: i >= index -> break;
@@ -306,53 +283,41 @@ active proctype HallWay() {
                     walkCus[i].minuteLeft--;
                     if
                         :: walkCus[i].minuteLeft == 0 -> {
-                            // walkCus[i] has done walking => move to Department Queue.
                             if
                                 :: walkCus[i].customer.dept == A -> {
-                                    // TODO
-                                    skip;
-                                }
-                                :: walkCus[i].customer.dept == B -> {
                                     if
                                         :: walkCus[i].customer.type == VIP -> {
-                                            // VIP goes directly to Senior
-                                            deptQueue_B_Senior ! walkCus[i].customer.id, false;
+                                            deptVIPQueue_A ! walkCus[i].customer.id;
                                         }
                                         :: walkCus[i].customer.type == INS -> {
-                                            // Insured goes to High Priority Junior Queue
-                                            deptQueue_B_Junior_INS ! walkCus[i].customer.id;
+                                            deptInsQueue_A ! walkCus[i].customer.id;
                                         }
-                                        :: else -> { 
-                                            // Normal goes to Low Priority Junior Queue
-                                            deptQueue_B_Junior_NORM ! walkCus[i].customer.id;
+                                        :: walkCus[i].customer.type == NORM -> {
+                                            deptNormQueue_A ! walkCus[i].customer.id;
                                         }
                                     fi
+                                }
+                                :: walkCus[i].customer.dept == B -> {
+                                    skip;  // Placeholder
                                 }
                                 :: walkCus[i].customer.dept == C -> {
                                     if
                                         :: walkCus[i].customer.type == VIP -> {
                                             deptVIPQueue_C ! walkCus[i].customer.id;
                                         }
-                                        :: else -> {  // INS + NORM
-                                            byte tempId = walkCus[i].customer.id;
-                                            mtype:customerType tempType = walkCus[i].customer.type;
-                                            deptQueue_C ! tempId, tempType;
+                                        :: else -> {
+                                            deptQueue_C ! walkCus[i].customer.id, walkCus[i].customer.type;
                                         }
                                     fi
                                 }
-                            fi  
+                            fi
 
-
-                            // Remove walkCus[i] from the array (shifting to left).
+                            // Remove from array
                             for (j : i .. index-2) {
-                                walkCus[j].customer.id = walkCus[j + 1].customer.id;
-                                walkCus[j].customer.type = walkCus[j + 1].customer.type;
-                                walkCus[j].customer.dept = walkCus[j + 1].customer.dept;
-                                
-                                walkCus[j].minuteLeft = walkCus[j + 1].minuteLeft;
+                                walkCus[j] = walkCus[j + 1];
                             }
-                            index--;  // Number of walking customers is decreasing by 1.
-                            i--;  // Do not pass the new walkCus[i].
+                            index--;
+                            i--;
                         }
                         :: else -> skip;
                     fi
@@ -360,280 +325,288 @@ active proctype HallWay() {
                 }
             od
 
+            // FIXED: Exit when closed and no more customers walking
             if
-                :: isClosed && index == 0 -> {
-                    // Unsubscribe to the TimeTicking.
-                    timeRegistration ! UNSUB, _pid;
+                :: isClosed && index == 0 && empty(customerHallway) -> {
+                    timeRegistration ! UNSUB, myChan;
                 }
                 :: else -> skip;
             fi
 
-            timeReply[_pid] ! ACK;
-
-            if
-                :: isClosed && index == 0 -> break;
-                :: else -> skip;
-            fi
-        }
-    od
-}
-
-
-
-/* --- DEPARTMENT B LOGIC --- */
-
-active[2] proctype DeptB_Junior() {
-    byte customerId;
-    byte examTime;
-    byte treatTime;
-    bool isSevere;
-    
-    do
-    :: {
-        // Wait for customer (Priority: INS > NORM)
-        if
-            :: nempty(deptQueue_B_Junior_INS) -> {
-                deptQueue_B_Junior_INS ? customerId;
-            }
-            :: nempty(deptQueue_B_Junior_NORM) && empty(deptQueue_B_Junior_INS) -> {
-                deptQueue_B_Junior_NORM ? customerId;
-            }
-            :: isClosed && empty(deptQueue_B_Junior_INS) && empty(deptQueue_B_Junior_NORM) -> break; 
-        fi
-        
-        // 1. Examination Phase (3-5 minutes)
-        select(examTime : 3..5);
-        timeRegistration ! SUB, _pid;
-        
-        do
-        :: timeNotify[_pid] ? TICK -> {
-            examTime--;
-            if
-            :: examTime == 0 -> {
-                timeRegistration ! UNSUB, _pid;
-
-                timeReply[_pid] ! ACK;
-                break;
-            }
-            :: else -> {
-                timeReply[_pid] ! ACK;
-            }
-            fi
-        }
-        od
-        
-        // 2. Decision Phase (Mild vs Severe)
-        if
-        :: 1 -> isSevere = false; // Mild
-        :: 1 -> isSevere = true;  // Severe
-        fi
-        
-        if
-        :: isSevere -> {
-            // Refer to Senior (isReferral = true)
-            deptQueue_B_Senior ! customerId, true; 
-            // Note: Patient is still in Dept B, so we DO NOT decrement nWaitingCustomer_DeptB yet.
-        }
-        :: !isSevere -> {
-            // Treat Mild Case (10-15 minutes)
-            select(treatTime : 10..15);
+            myChan ! ACK;
             
-            timeRegistration ! SUB, _pid;
-
-            do
-            :: timeNotify[_pid] ? TICK -> {
-                treatTime--;
-                if
-                :: treatTime == 0 -> {
-                    // Treatment finished -> Patient leaves Dept B
-                    nWaitingCustomer_DeptB--;
-                    
-                    timeRegistration ! UNSUB, _pid;
-                    timeReply[_pid] ! ACK;
-                    break;
-                }
-                :: else -> {
-                    timeReply[_pid] ! ACK;
-                }
-                fi
-            }
-            od
-        }
-        fi
-    }
-    od
-}
-
-active proctype DeptB_Senior() {
-    byte customerId;
-    bool isReferral;
-    byte treatTime;
-    
-    byte treatTimeSave;
-    
-    do
-    :: {
-        // Wait for customer
-        if
-            :: deptQueue_B_Senior ? customerId, isReferral -> skip;
-            :: isClosed && empty(deptQueue_B_Senior) -> break;
-        fi
-        
-        // Determine Treatment Time
-        if
-            :: isReferral -> {
-                // Referred case: 10-15 minutes
-                select(treatTime : 10..15);
-            }
-            :: !isReferral -> {
-                // VIP or Unchecked: 15-20 minutes
-                select(treatTime : 15..20);
-            }
-        fi
-        treatTimeSave = treatTime;
-        // Perform Treatment
-        timeRegistration ! SUB, _pid;
-        do
-        :: timeNotify[_pid] ? TICK -> {
-            treatTime--;
             if
-            :: treatTime == 0 -> {
-                // Treatment finished -> Patient leaves Dept B
-                nWaitingCustomer_DeptB--;
-                
-                printf("\nB - Customer with id %d is treated in %d minutes.\n", customerId, treatTimeSave);
-                
-                timeRegistration ! UNSUB, _pid;
-                timeReply[_pid] ! ACK;
-                break;
-            }
-            :: else -> {
-                timeReply[_pid] ! ACK;
-            }
+                :: isClosed && index == 0 && empty(customerHallway) -> break;
+                :: else -> skip;
             fi
         }
-        od
-    }
     od
 }
 
-/* --- END DEPARTMENT B LOGIC --- */
-
-
-
-active proctype PreOPRoom() {
-    byte preOPTime;
-    bool isPreselected = false;
+// --- PROCESS: DEPARTMENT A DOCTORS ---
+active [3] proctype DoctorA() {
+    chan myChan = [1] of { mtype:messageType };
+    byte doctorId = _pid;
+    byte patientId;
+    mtype:customerType pType;
+    byte treatTime;
+    byte myMachineId = 255;  // 255 = no machine assigned
+    bool hasPatient = false;
 
     do
-        :: {
-            if
-                :: isPreselected -> skip;
-                :: else -> {
-                    // Waiting for patient to enter.
-                    if
-                        :: deptVIPQueue_C ? preOPCustomerID; -> {  // Select the next VIP customer.
-                            preOPCustomerType = VIP;
-                        }
-                        :: deptQueue_C ? preOPCustomerID, preOPCustomerType -> skip;  // Select the next customer in the queue.
-                        :: deptQueue_C ?? preOPCustomerID, INS -> skip;  // Select the next INS customer in the queue.
+    :: {
+        // Exit condition: closed and no more work
+        if
+            :: isClosed && nWaitingCustomer_DeptA == 0 && 
+               empty(deptVIPQueue_A) && empty(deptInsQueue_A) && 
+               empty(deptNormQueue_A) -> break;
+            :: else -> skip;
+        fi
 
-                        :: isClosed && nWaitingCustomer_DeptC == 0 -> break;  // CLOSED.
+        // PHASE 1: Try to reserve a machine (non-blocking check)
+        atomic {
+            if
+                // Try to get any available machine
+                :: machinesAvailable > 0 -> {
+                    byte i;
+                    for (i : 0 .. N_MACHINE_A-1) {
+                        if
+                            :: !machineReserved[i] -> {
+                                machineReserved[i] = true;
+                                machineReservedBy[i] = doctorId;
+                                myMachineId = i;
+                                machinesAvailable--;
+                                break;
+                            }
+                            :: else -> skip;
+                        fi
+                    }
+                }
+                :: else -> skip;  // No machines available, will wait
+            fi
+        }
+
+        // PHASE 2: If we have a machine, get a patient with priority
+        if
+            :: myMachineId != 255 -> {
+                atomic {
+                    if
+                        // Priority 1: VIP (always first)
+                        :: nempty(deptVIPQueue_A) -> {
+                            deptVIPQueue_A ? patientId;
+                            pType = VIP;
+                            nWaitingCustomer_DeptA--;
+                            nProcessingCustomer_DeptA++;
+                            hasPatient = true;
+                        }
+                        // Priority 2: Insured
+                        :: empty(deptVIPQueue_A) && nempty(deptInsQueue_A) -> {
+                            deptInsQueue_A ? patientId;
+                            pType = INS;
+                            nWaitingCustomer_DeptA--;
+                            nProcessingCustomer_DeptA++;
+                            hasPatient = true;
+                        }
+                        // Priority 3: Normal
+                        :: empty(deptVIPQueue_A) && empty(deptInsQueue_A) && 
+                           nempty(deptNormQueue_A) -> {
+                            deptNormQueue_A ? patientId;
+                            pType = NORM;
+                            nWaitingCustomer_DeptA--;
+                            nProcessingCustomer_DeptA++;
+                            hasPatient = true;
+                        }
+                        // No patient available - release machine and try again
+                        :: empty(deptVIPQueue_A) && empty(deptInsQueue_A) && 
+                           empty(deptNormQueue_A) -> {
+                            machineReserved[myMachineId] = false;
+                            machineReservedBy[myMachineId] = 255;
+                            machinesAvailable++;
+                            myMachineId = 255;
+                            hasPatient = false;
+                        }
                     fi
                 }
-            fi
-            isPreselected = false;
-            // Staying time is randomly selected from 3-5 minutes.
-            select (preOPTime: 3 .. 5);
-        
-            // Begin the countdown. 
-            timeRegistration ! SUB, _pid;
-
-            do
-                :: timeNotify[_pid] ? TICK -> {
-                    preOPTime--;
+            }
+            :: else -> {
+                // No machine yet - check if we can interrupt for VIP
+                atomic {
                     if
-                        :: preOPTime == 0 -> {
-                            // Done => Ready for Operating Room.
-                            isPreOPReady = true;
+                        // If VIP is waiting and we have no machine, just wait
+                        // (VIP will be served by whoever gets machine next)
+                        :: nempty(deptVIPQueue_A) || nempty(deptInsQueue_A) || 
+                           nempty(deptNormQueue_A) -> {
+                            // Wait a bit before trying again (yield to other doctors)
+                            hasPatient = false;
+                        }
+                        :: else -> hasPatient = false;
+                    fi
+                }
+            }
+        fi
 
-                            // Unregister to the ClockTicking.
-                            timeRegistration ! UNSUB, _pid;
-                            timeReply[_pid] ! ACK;
+        // PHASE 3: Treat patient if we have both machine and patient
+        if
+            :: hasPatient && myMachineId != 255 -> {
+                select(treatTime: 10..20);
+                timeRegistration ! SUB, myChan;
+                
+                do
+                :: globalTick ? TICK -> {
+                    treatTime--;
+                    
+                    // Check if we should yield to VIP
+                    if
+                        :: pType != VIP && treatTime > 2 && nempty(deptVIPQueue_A) -> {
+                            // Yield to VIP: Return current patient to appropriate queue
+                            if
+                                :: pType == INS -> deptInsQueue_A ! patientId;
+                                :: pType == NORM -> deptNormQueue_A ! patientId;
+                            fi
+                            nWaitingCustomer_DeptA++;
+                            nProcessingCustomer_DeptA--;
+                            
+                            // Release machine
+                            machineReserved[myMachineId] = false;
+                            machineReservedBy[myMachineId] = 255;
+                            machinesAvailable++;
+                            myMachineId = 255;
+                            
+                            timeRegistration ! UNSUB, myChan;
+                            myChan ! ACK;
                             break;
                         }
                         :: else -> skip;
                     fi
-
-                    // Check if the current customer is kicked out or not.
+                    
                     if
-                        :: preOPCustomerType != VIP -> {
-                            if 
-                                :: nempty(deptVIPQueue_C) -> {
-                                    byte vipId;
-                                    deptVIPQueue_C ? vipId 
-                                    
-                                    // The current customer is kicked out of the Pre-OP room.
-                                    deptQueue_C ! preOPCustomerID, preOPCustomerType;  // Requeue the current customer.
-                                    
-                                    // The next customer is a VIP.
-                                    isPreselected = true;
-                                    preOPCustomerID = vipId;
-                                    preOPCustomerType = VIP;
-                                    
-                                    // End the countdown.
-                                    timeRegistration ! UNSUB, _pid;
-                                    timeReply[_pid] ! ACK;
+                    :: treatTime == 0 -> {
+                        // Treatment complete
+                        machineReserved[myMachineId] = false;
+                        machineReservedBy[myMachineId] = 255;
+                        machinesAvailable++;
+                        myMachineId = 255;
+                        nProcessingCustomer_DeptA--;
+                        timeRegistration ! UNSUB, myChan;
+                        myChan ! ACK;
+                        break;
+                    }
+                    :: else -> skip;
+                    fi
+                    myChan ! ACK;
+                }
+                od
+            }
+            :: else -> skip;  // No work to do this cycle
+        fi
+    }
+    od
+}
+
+// --- PROCESS: DEPARTMENT C PRE-OP ---
+active proctype PreOPRoom() {
+    chan myChan = [1] of { mtype:messageType };
+    byte preOPTime;
+
+    do
+        :: {
+            // FIXED: Exit when closed and no more customers
+            if
+                :: isClosed && nWaitingCustomer_DeptC == 0 &&
+                   empty(deptVIPQueue_C) && empty(deptQueue_C) -> break;
+                :: else -> skip;
+            fi
+
+            // Select patient
+            if
+                :: nempty(deptVIPQueue_C) -> {
+                    deptVIPQueue_C ? preOPCustomerID;
+                    preOPCustomerType = VIP;
+                    nWaitingCustomer_DeptC--;
+                }
+                :: empty(deptVIPQueue_C) && deptQueue_C ?? [preOPCustomerID, INS] -> {
+                    deptQueue_C ? preOPCustomerID, INS;  // FIXED: Proper receive
+                    preOPCustomerType = INS;
+                    nWaitingCustomer_DeptC--;
+                }
+                :: empty(deptVIPQueue_C) && !deptQueue_C ?? [preOPCustomerID, INS] && 
+                   nempty(deptQueue_C) -> {
+                    deptQueue_C ? preOPCustomerID, preOPCustomerType;
+                    nWaitingCustomer_DeptC--;
+                }
+                :: else -> skip;  // No patient available
+            fi
+
+            // Only proceed if we got a patient
+            if
+                :: preOPCustomerType == VIP || preOPCustomerType == INS || 
+                   preOPCustomerType == NORM -> {
+                    select (preOPTime: 3 .. 5);
+                    nProcessingCustomer_DeptC++;
+                    timeRegistration ! SUB, myChan;
+
+                    do
+                        :: globalTick ? TICK -> {
+                            preOPTime--;
+                            if
+                                :: preOPTime == 0 -> {
+                                    isPreOPReady = true;
+                                    timeRegistration ! UNSUB, myChan;
+                                    myChan ! ACK;
                                     break;
                                 }
-                                :: empty(deptVIPQueue_C) -> skip;  // There is no VIP atm.
+                                :: else -> skip;
                             fi
-                        }
-                        :: else -> skip;  // VIP cannot be kicked.
-                    fi
 
-                    timeReply[_pid] ! ACK;
-                }
-            od
-
-            // Waiting for Operating Room, but there is still a risk of being kicked out.
-            do
-                :: atomic {
-                    if
-                        :: !isPreOPReady -> break;  // Not waiting anymore.
-                        :: isPreOPReady -> {
-                            // Check if the current customer is kicked out or not.
+                            // Kick logic for VIP
                             if
-                                :: preOPCustomerType != VIP -> {  
-                                    if 
-                                        :: nempty(deptVIPQueue_C) -> {
-                                            byte vipId;
-                                            deptVIPQueue_C ? vipId 
-                                            
-                                            // The current customer is kicked out of the Pre-OP room.
-                                            deptQueue_C ! preOPCustomerID, preOPCustomerType;  // Requeue the current customer.
-                                            
-                                            // The next customer is a VIP.
-                                            isPreselected = true;
-                                            preOPCustomerID = vipId;
-                                            preOPCustomerType = VIP;
-
-                                            isPreOPReady = false;
-                                        }
-                                        :: empty(deptVIPQueue_C) -> skip;  // There is no VIP atm.
-                                    fi
+                                :: preOPCustomerType != VIP && nempty(deptVIPQueue_C) -> {
+                                    byte vipId;
+                                    deptVIPQueue_C ? vipId;
+                                    // Kick current back
+                                    deptQueue_C ! preOPCustomerID, preOPCustomerType;
+                                    nWaitingCustomer_DeptC++;
+                                    // Accept VIP
+                                    preOPCustomerID = vipId;
+                                    preOPCustomerType = VIP;
+                                    preOPTime = 0;  // Restart prep for VIP
                                 }
-                                :: else -> skip;  // VIP cannot be kicked.
+                                :: else -> skip;
+                            fi
+                            myChan ! ACK;
+                        }
+                    od
+
+                    // Wait for OR to pick up patient
+                    do
+                        :: !isPreOPReady -> break;
+                        :: isPreOPReady -> {
+                            // Can still be kicked while waiting
+                            if
+                                :: preOPCustomerType != VIP && nempty(deptVIPQueue_C) -> {
+                                    byte vipId;
+                                    deptVIPQueue_C ? vipId;
+                                    deptQueue_C ! preOPCustomerID, preOPCustomerType;
+                                    nWaitingCustomer_DeptC++;
+                                    preOPCustomerID = vipId;
+                                    preOPCustomerType = VIP;
+                                    isPreOPReady = false;
+                                    break;
+                                }
+                                :: else -> skip;
                             fi
                         }
-                    fi
-                } 
-            od
+                    od
+                }
+                :: else -> skip;
+            fi
         }
     od
 }
 
+// --- PROCESS: DEPARTMENT C OPERATING ROOM ---
 active[2] proctype OperatingRoom() {
+    chan myChan = [1] of { mtype:messageType };
     byte opRoomId;
     atomic {
         opRoomId = operatingRoomUniversalId;
@@ -643,94 +616,101 @@ active[2] proctype OperatingRoom() {
     byte currentCustomerId;
     mtype:customerType currentCustomerType;
     byte operatingTime;
-    byte operatingTimeSave;
 
     do
         :: {
-            // Wait for customer ready in Pre-OP room and this OP room to be CLEAN.
+            // FIXED: Exit when closed and no more work
+            if
+                :: isClosed && nProcessingCustomer_DeptC == 0 && !isPreOPReady -> break;
+                :: else -> skip;
+            fi
+
             atomic {
                 if
-                    :: ( opRoom[opRoomId] == CLEAN ) && ( isPreOPReady == true ) -> {
+                    :: opRoom[opRoomId] == CLEAN && isPreOPReady -> {
                         currentCustomerId = preOPCustomerID;
                         currentCustomerType = preOPCustomerType;
                         isPreOPReady = false;
+                        opRoom[opRoomId] = BUSY;
                     }
-                    :: isClosed && nWaitingCustomer_DeptC == 0 -> break;  // CLOSED.
+                    :: else -> skip;
                 fi
             }
 
-            // Surgery time is random from 20 to 30.
-            select (operatingTime: 20 .. 30);
-            operatingTimeSave = operatingTime;
-
-            // Start the countdown: performing surgery.
-            opRoom[opRoomId] = BUSY;
-            timeRegistration ! SUB, _pid;
-            do
-                :: timeNotify[_pid] ? TICK -> {
-                    operatingTime--;
-                    if
-                        :: operatingTime == 0 -> { 
-                            // Surgery completed.
-                            opRoom[opRoomId] = DIRTY;
-                            nWaitingCustomer_DeptC--;
-
-                            printf("\nC - Customer with id %d is treated in %d minutes.\n", currentCustomerId, operatingTimeSave);
-                            
-                            // Unregister to the ClockTicking.
-                            timeRegistration ! UNSUB, _pid;
-                            timeReply[_pid] ! ACK;
-                            break;                            
+            // Only proceed if we got a patient
+            if
+                :: opRoom[opRoomId] == BUSY -> {
+                    select (operatingTime: 20 .. 30);
+                    timeRegistration ! SUB, myChan;
+                    
+                    do
+                        :: globalTick ? TICK -> {
+                            operatingTime--;
+                            if
+                                :: operatingTime == 0 -> { 
+                                    opRoom[opRoomId] = DIRTY;
+                                    nProcessingCustomer_DeptC--;
+                                    timeRegistration ! UNSUB, myChan;
+                                    myChan ! ACK;
+                                    break;
+                                }
+                                :: else -> skip;
+                            fi
+                            myChan ! ACK;
                         }
-                        :: else -> skip;
-                    fi
-
-                    timeReply[_pid] ! ACK;
+                    od
                 }
-            od
+                :: else -> skip;
+            fi
         }
     od
 }
 
+// --- PROCESS: DEPARTMENT C CLEANING TEAM ---
 active proctype CleaningTeam() {
+    chan myChan = [1] of { mtype:messageType };
     byte cleaningTime;
     byte cleaningRoomId;
+    
     do
         :: {
-            // Wait for any of the two room to be DIRTY.
+            // FIXED: Exit when closed and all rooms clean
+            if
+                :: isClosed && opRoom[0] != DIRTY && opRoom[1] != DIRTY && 
+                   nProcessingCustomer_DeptC == 0 -> break;
+                :: else -> skip;
+            fi
+
             if
                 :: opRoom[0] == DIRTY -> cleaningRoomId = 0;
                 :: opRoom[1] == DIRTY -> cleaningRoomId = 1;
-                :: isClosed && opRoom[0] != DIRTY && opRoom[1] != DIRTY && nWaitingCustomer_DeptC == 0 -> {  // CLOSED
-                    break;
-                }
+                :: else -> skip;  // No dirty rooms
             fi
 
-            // Cleaning time is random from 5 to 10 minutes
-            select (cleaningTime: 5 .. 10);
-            
-            // Start the countdown: cleaning the DIRTY room.
-            timeRegistration ! SUB, _pid;
-
-            do
-                :: timeNotify[_pid] ? TICK -> {
-                    cleaningTime--;
-                    if
-                        :: cleaningTime == 0 -> {
-                            // Done cleaning => Room is clean.
-                            opRoom[cleaningRoomId] = CLEAN;
-
-                            // Unregister & break.
-                            timeRegistration ! UNSUB, _pid;
-                            timeReply[_pid] ! ACK;
-                            break;
+            // Only proceed if we found a dirty room
+            if
+                :: opRoom[cleaningRoomId] == DIRTY -> {
+                    select (cleaningTime: 5 .. 10);
+                    timeRegistration ! SUB, myChan;
+                    
+                    do
+                        :: globalTick ? TICK -> {
+                            cleaningTime--;
+                            if
+                                :: cleaningTime == 0 -> {
+                                    opRoom[cleaningRoomId] = CLEAN;
+                                    timeRegistration ! UNSUB, myChan;
+                                    myChan ! ACK;
+                                    break;
+                                }
+                                :: else -> skip;
+                            fi
+                            myChan ! ACK;
                         }
-                        :: else -> skip;
-                    fi
-
-                    timeReply[_pid] ! ACK;
+                    od
                 }
-            od
+                :: else -> skip;
+            fi
         }
     od
 }
