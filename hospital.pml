@@ -391,7 +391,7 @@ active [3] proctype DoctorA() {
             :: myMachineId != 255 -> {
                 atomic {
                     if
-                        // Priority 1: VIP (always first)
+                        // Priority 1: VIP (always first in queue)
                         :: nempty(deptVIPQueue_A) -> {
                             deptVIPQueue_A ? patientId;
                             pType = VIP;
@@ -399,7 +399,7 @@ active [3] proctype DoctorA() {
                             nProcessingCustomer_DeptA++;
                             hasPatient = true;
                         }
-                        // Priority 2: Insured
+                        // Priority 2: Insured (second in queue)
                         :: empty(deptVIPQueue_A) && nempty(deptInsQueue_A) -> {
                             deptInsQueue_A ? patientId;
                             pType = INS;
@@ -407,7 +407,7 @@ active [3] proctype DoctorA() {
                             nProcessingCustomer_DeptA++;
                             hasPatient = true;
                         }
-                        // Priority 3: Normal
+                        // Priority 3: Normal (last in queue)
                         :: empty(deptVIPQueue_A) && empty(deptInsQueue_A) && 
                            nempty(deptNormQueue_A) -> {
                             deptNormQueue_A ? patientId;
@@ -429,19 +429,8 @@ active [3] proctype DoctorA() {
                 }
             }
             :: else -> {
-                // No machine yet - check if we can interrupt for VIP
-                atomic {
-                    if
-                        // If VIP is waiting and we have no machine, just wait
-                        // (VIP will be served by whoever gets machine next)
-                        :: nempty(deptVIPQueue_A) || nempty(deptInsQueue_A) || 
-                           nempty(deptNormQueue_A) -> {
-                            // Wait a bit before trying again (yield to other doctors)
-                            hasPatient = false;
-                        }
-                        :: else -> hasPatient = false;
-                    fi
-                }
+                // No machine yet - just wait for one to become available
+                hasPatient = false;
             }
         fi
 
@@ -455,33 +444,9 @@ active [3] proctype DoctorA() {
                 :: globalTick ? TICK -> {
                     treatTime--;
                     
-                    // Check if we should yield to VIP
-                    if
-                        :: pType != VIP && treatTime > 2 && nempty(deptVIPQueue_A) -> {
-                            // Yield to VIP: Return current patient to appropriate queue
-                            if
-                                :: pType == INS -> deptInsQueue_A ! patientId;
-                                :: pType == NORM -> deptNormQueue_A ! patientId;
-                            fi
-                            nWaitingCustomer_DeptA++;
-                            nProcessingCustomer_DeptA--;
-                            
-                            // Release machine
-                            machineReserved[myMachineId] = false;
-                            machineReservedBy[myMachineId] = 255;
-                            machinesAvailable++;
-                            myMachineId = 255;
-                            
-                            timeRegistration ! UNSUB, myChan;
-                            myChan ! ACK;
-                            break;
-                        }
-                        :: else -> skip;
-                    fi
-                    
                     if
                     :: treatTime == 0 -> {
-                        // Treatment complete
+                        // Treatment complete - release machine
                         machineReserved[myMachineId] = false;
                         machineReservedBy[myMachineId] = 255;
                         machinesAvailable++;
