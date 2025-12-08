@@ -40,6 +40,26 @@ chan timeReply[N_SUBJECTS] = [0] of { mtype:messageType };
 chan customerEntrance = [10] of { Customer };
 chan customerHallway = [10] of { Customer };
 
+
+
+// Dept B: Exam (4) + Treatment (12.5 to 17.5) ~ 20 (safe margin)
+#define avgTreatmentTime_DeptB 20
+/*
+Department B Channels:
+- Junior Queue High Priority (Insured)
+- Junior Queue Low Priority (Normal)
+- Senior Queue (VIP + Referrals)
+*/
+chan deptQueue_B_Junior_INS = [10] of { byte }; 
+chan deptQueue_B_Junior_NORM = [10] of { byte };
+chan deptQueue_B_Senior = [10] of { byte, bool }; // ID, isReferral (true=referral, false=direct VIP)
+
+// Variables for Dept B rejection rule
+byte nWaitingCustomer_DeptB = 0;
+bool isClosed_DeptB = false;
+
+
+
 /*
 Department C: 
 - Time in Pre-OP Room [3-5]  
@@ -207,8 +227,16 @@ active proctype GateKeeper() {
                                     skip;
                                 }
                                 :: processingCustomer.dept == B -> {
-                                    // TODO
-                                    skip;
+                                    // Department B Admission with Rejection Rule
+                                    if
+                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptB + 1) * avgTreatmentTime_DeptB -> {
+                                            customerHallway ! processingCustomer;
+                                            nWaitingCustomer_DeptB++;
+                                        }
+                                        :: else -> {
+                                            isClosed_DeptB = true;
+                                        }
+                                    fi
                                 }
                                 :: processingCustomer.dept == C -> {  // Checking rejection for department C
                                     if
@@ -285,8 +313,20 @@ active proctype HallWay() {
                                     skip;
                                 }
                                 :: walkCus[i].customer.dept == B -> {
-                                    // TODO
-                                    skip;
+                                    if
+                                        :: walkCus[i].customer.type == VIP -> {
+                                            // VIP goes directly to Senior
+                                            deptQueue_B_Senior ! walkCus[i].customer.id, false;
+                                        }
+                                        :: walkCus[i].customer.type == INS -> {
+                                            // Insured goes to High Priority Junior Queue
+                                            deptQueue_B_Junior_INS ! walkCus[i].customer.id;
+                                        }
+                                        :: else -> { 
+                                            // Normal goes to Low Priority Junior Queue
+                                            deptQueue_B_Junior_NORM ! walkCus[i].customer.id;
+                                        }
+                                    fi
                                 }
                                 :: walkCus[i].customer.dept == C -> {
                                     if
@@ -337,6 +377,144 @@ active proctype HallWay() {
         }
     od
 }
+
+
+
+/* --- DEPARTMENT B LOGIC --- */
+
+active[2] proctype DeptB_Junior() {
+    byte customerId;
+    byte examTime;
+    byte treatTime;
+    bool isSevere;
+    
+    do
+    :: {
+        // Wait for customer (Priority: INS > NORM)
+        if
+            :: nempty(deptQueue_B_Junior_INS) -> {
+                deptQueue_B_Junior_INS ? customerId;
+            }
+            :: nempty(deptQueue_B_Junior_NORM) && empty(deptQueue_B_Junior_INS) -> {
+                deptQueue_B_Junior_NORM ? customerId;
+            }
+            :: isClosed && empty(deptQueue_B_Junior_INS) && empty(deptQueue_B_Junior_NORM) -> break; 
+        fi
+        
+        // 1. Examination Phase (3-5 minutes)
+        select(examTime : 3..5);
+        timeRegistration ! SUB, _pid;
+        
+        do
+        :: timeNotify[_pid] ? TICK -> {
+            examTime--;
+            if
+            :: examTime == 0 -> {
+                timeReply[_pid] ! ACK;
+                break;
+            }
+            :: else -> {
+                timeReply[_pid] ! ACK;
+            }
+            fi
+        }
+        od
+        
+        // 2. Decision Phase (Mild vs Severe)
+        if
+        :: 1 -> isSevere = false; // Mild
+        :: 1 -> isSevere = true;  // Severe
+        fi
+        
+        if
+        :: isSevere -> {
+            // Refer to Senior (isReferral = true)
+            timeRegistration ! UNSUB, _pid;
+            deptQueue_B_Senior ! customerId, true; 
+            // Note: Patient is still in Dept B, so we DO NOT decrement nWaitingCustomer_DeptB yet.
+        }
+        :: !isSevere -> {
+            // Treat Mild Case (10-15 minutes)
+            select(treatTime : 10..15);
+            
+            do
+            :: timeNotify[_pid] ? TICK -> {
+                treatTime--;
+                if
+                :: treatTime == 0 -> {
+                    // Treatment finished -> Patient leaves Dept B
+                    nWaitingCustomer_DeptB--;
+                    
+                    timeRegistration ! UNSUB, _pid;
+                    timeReply[_pid] ! ACK;
+                    break;
+                }
+                :: else -> {
+                    timeReply[_pid] ! ACK;
+                }
+                fi
+            }
+            od
+        }
+        fi
+    }
+    od
+}
+
+active proctype DeptB_Senior() {
+    byte customerId;
+    bool isReferral;
+    byte treatTime;
+    
+    byte treatTimeSave;
+    
+    do
+    :: {
+        // Wait for customer
+        if
+            :: deptQueue_B_Senior ? customerId, isReferral -> skip;
+            :: isClosed && empty(deptQueue_B_Senior) -> break;
+        fi
+        
+        // Determine Treatment Time
+        if
+            :: isReferral -> {
+                // Referred case: 10-15 minutes
+                select(treatTime : 10..15);
+            }
+            :: !isReferral -> {
+                // VIP or Unchecked: 15-20 minutes
+                select(treatTime : 15..20);
+            }
+        fi
+        treatTimeSave = treatTime;
+        // Perform Treatment
+        timeRegistration ! SUB, _pid;
+        do
+        :: timeNotify[_pid] ? TICK -> {
+            treatTime--;
+            if
+            :: treatTime == 0 -> {
+                // Treatment finished -> Patient leaves Dept B
+                nWaitingCustomer_DeptB--;
+                
+                printf("\nB - Customer with id %d is treated in %d minutes.\n", customerId, treatTimeSave);
+                
+                timeRegistration ! UNSUB, _pid;
+                timeReply[_pid] ! ACK;
+                break;
+            }
+            :: else -> {
+                timeReply[_pid] ! ACK;
+            }
+            fi
+        }
+        od
+    }
+    od
+}
+
+/* --- END DEPARTMENT B LOGIC --- */
 
 
 
@@ -462,6 +640,7 @@ active[2] proctype OperatingRoom() {
     byte currentCustomerId;
     mtype:customerType currentCustomerType;
     byte operatingTime;
+    byte operatingTimeSave;
 
     do
         :: {
@@ -479,6 +658,7 @@ active[2] proctype OperatingRoom() {
 
             // Surgery time is random from 20 to 30.
             select (operatingTime: 20 .. 30);
+            operatingTimeSave = operatingTime;
 
             // Start the countdown: performing surgery.
             opRoom[opRoomId] = BUSY;
@@ -491,6 +671,8 @@ active[2] proctype OperatingRoom() {
                             // Surgery completed.
                             opRoom[opRoomId] = DIRTY;
                             nWaitingCustomer_DeptC--;
+
+                            printf("\nC - Customer with id %d is treated in %d minutes.\n", currentCustomerId, operatingTimeSave);
                             
                             // Unregister to the ClockTicking.
                             timeRegistration ! UNSUB, _pid;
