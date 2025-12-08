@@ -9,6 +9,10 @@
 #define avgTreatmentTime_DeptA 15 /* Average of 10-20 mins */
 #define avgParallelTreatmentTime_DeptA 7  /* 15/2 = 7.5 minutes per customer with 3 doctors & 2 machines */
 
+// Dept B: Exam (4) + Treatment (12.5 to 17.5) ~ 20 (safe margin)
+#define avgTreatmentTime_DeptB 20
+#define avgParallelTreatmentTime_DeptB 7  /* 20 / 3 = 6.667 minutes per customer with 2 juniors & 1 senior */
+
 // --- DEPARTMENT C CONFIGURATION ---
 #define N_OPERATING_ROOM 2
 // 4 (PreOp) + 25 (Surgery) + 7 (Cleaning) = 36
@@ -42,13 +46,19 @@ bool isClosed = false;
 chan timeRegistration = [MAX_PROCESSES] of { mtype:messageType, chan };
 
 // Entrance & Hallway Channels
-chan customerEntrance = [10] of { Customer };
+chan customerEntrance = [3] of { Customer };
 chan customerHallway = [10] of { Customer };
 
 
 
-// Dept B: Exam (4) + Treatment (12.5 to 17.5) ~ 20 (safe margin)
-#define avgTreatmentTime_DeptB 20
+// --- DEPARTMENT A GLOBALS ---
+chan deptQueue_A = [10] of { byte, mtype:customerType };
+chan deptVIPQueue_A = [10] of { byte };
+byte machinesAvailable = N_MACHINE_A; 
+byte nWaitingCustomer_DeptA = 0;
+byte nProcessingCustomer_DeptA = 0;
+
+
 /*
 Department B Channels:
 - Junior Queue High Priority (Insured)
@@ -65,13 +75,6 @@ bool isClosed_DeptB = false;
 
 
 
-// --- DEPARTMENT A GLOBALS ---
-chan deptQueue_A = [10] of { byte, mtype:customerType };
-chan deptVIPQueue_A = [10] of { byte };
-byte machinesAvailable = N_MACHINE_A; 
-byte nWaitingCustomer_DeptA = 0;
-byte nProcessingCustomer_DeptA = 0;
-
 // --- DEPARTMENT C GLOBALS ---
 chan deptQueue_C = [10] of { byte, mtype:customerType };
 chan deptVIPQueue_C = [10] of { byte };
@@ -84,6 +87,7 @@ bool isPreOPReady = false;
 
 byte nWaitingCustomer_DeptC = 0;
 byte nProcessingCustomer_DeptC = 0;
+
 
 // --- PROCESS: CLOCK TICKING (THE HEARTBEAT) ---
 active proctype ClockTicking() {
@@ -243,7 +247,7 @@ active proctype GateKeeper() {
                                 :: processingCustomer.dept == B && !isClosed -> {
                                     // Department B Admission with Rejection Rule
                                     if
-                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptB + 1) * avgTreatmentTime_DeptB -> {
+                                        :: globalTime <= TIME_LIMIT - (nWaitingCustomer_DeptB + 1) * avgParallelTreatmentTime_DeptB -> {
                                             customerHallway ! processingCustomer;
                                             nWaitingCustomer_DeptB++;
                                         }
@@ -373,14 +377,14 @@ active proctype HallWay() {
                 :: isClosed && index == 0 && empty(customerHallway) -> {
                     timeRegistration ! UNSUB, myChan;
                 }
-                :: else -> skip;
+                :: !isClosed || index != 0 || nempty(customerHallway) -> skip;
             fi
 
             myChan ! ACK;
             
             if
                 :: isClosed && index == 0 && empty(customerHallway) -> break;
-                :: else -> skip;
+                :: !isClosed || index != 0 || nempty(customerHallway) -> skip;
             fi
         }
     od
@@ -391,88 +395,90 @@ active proctype HallWay() {
 /* --- DEPARTMENT B LOGIC --- */
 
 active[2] proctype DeptB_Junior() {
+    chan myChan = [1] of { mtype:messageType };
     byte customerId;
     byte examTime;
     byte treatTime;
     bool isSevere;
     
     do
-    :: {
-        // Wait for customer (Priority: INS > NORM)
-        if
-            :: nempty(deptQueue_B_Junior_INS) -> {
-                deptQueue_B_Junior_INS ? customerId;
-            }
-            :: nempty(deptQueue_B_Junior_NORM) && empty(deptQueue_B_Junior_INS) -> {
-                deptQueue_B_Junior_NORM ? customerId;
-            }
-            :: isClosed && empty(deptQueue_B_Junior_INS) && empty(deptQueue_B_Junior_NORM) -> break; 
-        fi
-        
-        // 1. Examination Phase (3-5 minutes)
-        select(examTime : 3..5);
-        timeRegistration ! SUB, _pid;
-        
-        do
-        :: timeNotify[_pid] ? TICK -> {
-            examTime--;
+        :: {
+            // Wait for customer (Priority: INS > NORM)
             if
-            :: examTime == 0 -> {
-                timeRegistration ! UNSUB, _pid;
+                :: nempty(deptQueue_B_Junior_INS) -> {
+                    deptQueue_B_Junior_INS ? customerId;
+                }
+                :: nempty(deptQueue_B_Junior_NORM) && empty(deptQueue_B_Junior_INS) -> {
+                    deptQueue_B_Junior_NORM ? customerId;
+                }
+                :: isClosed && empty(deptQueue_B_Junior_INS) && empty(deptQueue_B_Junior_NORM) -> break; 
+            fi
+            
+            // 1. Examination Phase (3-5 minutes)
+            select(examTime : 3..5);
+            timeRegistration ! SUB, myChan;
+            
+            do
+                :: myChan ? TICK -> {
+                    examTime--;
+                    if
+                    :: examTime == 0 -> {
+                        timeRegistration ! UNSUB, myChan;
 
-                timeReply[_pid] ! ACK;
-                break;
-            }
-            :: else -> {
-                timeReply[_pid] ! ACK;
-            }
+                        myChan ! ACK;
+                        break;
+                    }
+                    :: else -> {
+                        myChan ! ACK;
+                    }
+                    fi
+                }
+            od
+            
+            // 2. Decision Phase (Mild vs Severe)
+            if
+                :: 1 -> isSevere = false; // Mild
+                :: 1 -> isSevere = true;  // Severe
+            fi
+            
+            if
+                :: isSevere -> {
+                    // Refer to Senior (isReferral = true)
+                    deptQueue_B_Senior ! customerId, true; 
+                    // Note: Patient is still in Dept B, so we DO NOT decrement nWaitingCustomer_DeptB yet.
+                }
+                :: !isSevere -> {
+                    // Treat Mild Case (10-15 minutes)
+                    select(treatTime : 10..15);
+                    
+                    timeRegistration ! SUB, myChan;
+
+                    do
+                        :: myChan ? TICK -> {
+                            treatTime--;
+                            if
+                                :: treatTime == 0 -> {
+                                    // Treatment finished -> Patient leaves Dept B
+                                    nWaitingCustomer_DeptB--;
+                                    
+                                    timeRegistration ! UNSUB, myChan;
+                                    myChan ! ACK;
+                                    break;
+                                }
+                                :: else -> {
+                                    myChan ! ACK;
+                                }
+                            fi
+                        }
+                    od
+                }
             fi
         }
-        od
-        
-        // 2. Decision Phase (Mild vs Severe)
-        if
-        :: 1 -> isSevere = false; // Mild
-        :: 1 -> isSevere = true;  // Severe
-        fi
-        
-        if
-        :: isSevere -> {
-            // Refer to Senior (isReferral = true)
-            deptQueue_B_Senior ! customerId, true; 
-            // Note: Patient is still in Dept B, so we DO NOT decrement nWaitingCustomer_DeptB yet.
-        }
-        :: !isSevere -> {
-            // Treat Mild Case (10-15 minutes)
-            select(treatTime : 10..15);
-            
-            timeRegistration ! SUB, _pid;
-
-            do
-            :: timeNotify[_pid] ? TICK -> {
-                treatTime--;
-                if
-                :: treatTime == 0 -> {
-                    // Treatment finished -> Patient leaves Dept B
-                    nWaitingCustomer_DeptB--;
-                    
-                    timeRegistration ! UNSUB, _pid;
-                    timeReply[_pid] ! ACK;
-                    break;
-                }
-                :: else -> {
-                    timeReply[_pid] ! ACK;
-                }
-                fi
-            }
-            od
-        }
-        fi
-    }
     od
 }
 
 active proctype DeptB_Senior() {
+    chan myChan = [1] of { mtype:messageType };
     byte customerId;
     bool isReferral;
     byte treatTime;
@@ -480,128 +486,129 @@ active proctype DeptB_Senior() {
     byte treatTimeSave;
     
     do
-    :: {
-        // Wait for customer
-        if
-            :: deptQueue_B_Senior ? customerId, isReferral -> skip;
-            :: isClosed && empty(deptQueue_B_Senior) -> break;
-        fi
-        
-        // Determine Treatment Time
-        if
-            :: isReferral -> {
-                // Referred case: 10-15 minutes
-                select(treatTime : 10..15);
-            }
-            :: !isReferral -> {
-                // VIP or Unchecked: 15-20 minutes
-                select(treatTime : 15..20);
-            }
-        fi
-        treatTimeSave = treatTime;
-        // Perform Treatment
-        timeRegistration ! SUB, _pid;
-        do
-        :: timeNotify[_pid] ? TICK -> {
-            treatTime--;
+        :: {
+            // Wait for customer
             if
-            :: treatTime == 0 -> {
-                // Treatment finished -> Patient leaves Dept B
-                nWaitingCustomer_DeptB--;
-                
-                printf("\nB - Customer with id %d is treated in %d minutes.\n", customerId, treatTimeSave);
-                
-                timeRegistration ! UNSUB, _pid;
-                timeReply[_pid] ! ACK;
-                break;
-            }
-            :: else -> {
-                timeReply[_pid] ! ACK;
-            }
+                :: deptQueue_B_Senior ? customerId, isReferral -> skip;
+                :: isClosed && empty(deptQueue_B_Senior) -> break;
             fi
+            
+            // Determine Treatment Time
+            if
+                :: isReferral -> {
+                    // Referred case: 10-15 minutes
+                    select(treatTime : 10..15);
+                }
+                :: !isReferral -> {
+                    // VIP or Unchecked: 15-20 minutes
+                    select(treatTime : 15..20);
+                }
+            fi
+            treatTimeSave = treatTime;
+            // Perform Treatment
+            timeRegistration ! SUB, myChan;
+            do
+                :: myChan ? TICK -> {
+                    treatTime--;
+                    if
+                        :: treatTime == 0 -> {
+                            // Treatment finished -> Patient leaves Dept B
+                            nWaitingCustomer_DeptB--;
+                            
+                            printf("\nB - Customer with id %d is treated in %d minutes.\n", customerId, treatTimeSave);
+                            
+                            timeRegistration ! UNSUB, myChan;
+                            myChan ! ACK;
+                            break;
+                        }
+                        :: else -> {
+                            myChan ! ACK;
+                        }
+                    fi
+                }
+            od
         }
-        od
-    }
     od
 }
 
 /* --- END DEPARTMENT B LOGIC --- */
 
-// --- PROCESS: DEPARTMENT A DOCTORS ---
-active [3] proctype DoctorA() {
-    chan myChan = [1] of { mtype:messageType };
-    byte patientId;
-    mtype:customerType pType;
-    byte treatTime;
 
-    do
-    :: {
-        // FIXED: Proper exit condition check
-        if
-            :: isClosed && nWaitingCustomer_DeptA == 0 && 
-               empty(deptVIPQueue_A) && empty(deptQueue_A) -> break;
-            :: else -> skip;
-        fi
 
-        // Wait for Patient AND Machine
-        atomic {
-            if
-            :: machinesAvailable > 0 && nempty(deptVIPQueue_A) -> {
-                machinesAvailable--;
-                deptVIPQueue_A ? patientId;
-                pType = VIP;
-                nWaitingCustomer_DeptA--;
-                nProcessingCustomer_DeptA++;
-            }
-            :: machinesAvailable > 0 && empty(deptVIPQueue_A) && 
-               deptQueue_A ?? [patientId, INS] -> {
-                machinesAvailable--;
-                deptQueue_A ? patientId, INS;  // FIXED: Use ? instead of ??
-                pType = INS;
-                nWaitingCustomer_DeptA--;
-                nProcessingCustomer_DeptA++;
-            }
-            :: machinesAvailable > 0 && empty(deptVIPQueue_A) && 
-               !deptQueue_A ?? [patientId, INS] && nempty(deptQueue_A) -> {
-                machinesAvailable--;
-                deptQueue_A ? patientId, pType;
-                nWaitingCustomer_DeptA--;
-                nProcessingCustomer_DeptA++;
-            }
-            :: else -> skip;  // No patient or machine available
-            fi
-        }
+// // --- PROCESS: DEPARTMENT A DOCTORS ---
+// active [3] proctype DoctorA() {
+//     chan myChan = [1] of { mtype:messageType };
+//     byte patientId;
+//     mtype:customerType pType;
+//     byte treatTime;
 
-        // Only proceed if we got a patient
-        if
-            :: nProcessingCustomer_DeptA > 0 && 
-               (pType == VIP || pType == INS || pType == NORM) -> {
-                // Treatment
-                select(treatTime: 10..20);
-                timeRegistration ! SUB, myChan;
+//     do
+//     :: {
+//         if
+//             :: isClosed && nWaitingCustomer_DeptA == 0 && 
+//                empty(deptVIPQueue_A) && empty(deptQueue_A) -> break;
+//             :: else -> skip;
+//         fi
+
+//         // Wait for Patient AND Machine
+//         atomic {
+//             if
+//             :: machinesAvailable > 0 && nempty(deptVIPQueue_A) -> {
+//                 machinesAvailable--;
+//                 deptVIPQueue_A ? patientId;
+//                 pType = VIP;
+//                 nWaitingCustomer_DeptA--;
+//                 nProcessingCustomer_DeptA++;
+//             }
+//             :: machinesAvailable > 0 && empty(deptVIPQueue_A) && 
+//                deptQueue_A ?? [patientId, INS] -> {
+//                 machinesAvailable--;
+//                 deptQueue_A ? patientId, INS;  // FIXED: Use ? instead of ??
+//                 pType = INS;
+//                 nWaitingCustomer_DeptA--;
+//                 nProcessingCustomer_DeptA++;
+//             }
+//             :: machinesAvailable > 0 && empty(deptVIPQueue_A) && 
+//                !deptQueue_A ?? [patientId, INS] && nempty(deptQueue_A) -> {
+//                 machinesAvailable--;
+//                 deptQueue_A ? patientId, pType;
+//                 nWaitingCustomer_DeptA--;
+//                 nProcessingCustomer_DeptA++;
+//             }
+//             :: else -> skip;  // No patient or machine available
+//             fi
+//         }
+
+//         // Only proceed if we got a patient
+//         if
+//             :: nProcessingCustomer_DeptA > 0 && 
+//                (pType == VIP || pType == INS || pType == NORM) -> {
+//                 // Treatment
+//                 select(treatTime: 10..20);
+//                 timeRegistration ! SUB, myChan;
                 
-                do
-                :: globalTick ? TICK -> {
-                    treatTime--;
-                    if
-                    :: treatTime == 0 -> {
-                        machinesAvailable++;
-                        nProcessingCustomer_DeptA--;
-                        timeRegistration ! UNSUB, myChan;
-                        myChan ! ACK;
-                        break;
-                    }
-                    :: else -> skip;
-                    fi
-                    myChan ! ACK;
-                }
-                od
-            }
-            :: else -> skip;
-        fi
-    }
-    od
-}
+//                 do
+//                 :: globalTick ? TICK -> {
+//                     treatTime--;
+//                     if
+//                     :: treatTime == 0 -> {
+//                         machinesAvailable++;
+//                         nProcessingCustomer_DeptA--;
+//                         timeRegistration ! UNSUB, myChan;
+//                         myChan ! ACK;
+//                         break;
+//                     }
+//                     :: else -> skip;
+//                     fi
+//                     myChan ! ACK;
+//                 }
+//                 od
+//             }
+//             :: else -> skip;
+//         fi
+//     }
+//     od
+// }
 
 // --- PROCESS: DEPARTMENT C PRE-OP ---
 active proctype PreOPRoom() {
@@ -610,7 +617,6 @@ active proctype PreOPRoom() {
 
     do
         :: {
-            // FIXED: Exit when closed and no more customers
             if
                 :: isClosed && nWaitingCustomer_DeptC == 0 &&
                    empty(deptVIPQueue_C) && empty(deptQueue_C) -> break;
