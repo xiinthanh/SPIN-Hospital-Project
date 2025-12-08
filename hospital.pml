@@ -410,6 +410,8 @@ active[2] proctype DeptB_Junior() {
             examTime--;
             if
             :: examTime == 0 -> {
+                timeRegistration ! UNSUB, _pid;
+
                 timeReply[_pid] ! ACK;
                 break;
             }
@@ -429,7 +431,6 @@ active[2] proctype DeptB_Junior() {
         if
         :: isSevere -> {
             // Refer to Senior (isReferral = true)
-            timeRegistration ! UNSUB, _pid;
             deptQueue_B_Senior ! customerId, true; 
             // Note: Patient is still in Dept B, so we DO NOT decrement nWaitingCustomer_DeptB yet.
         }
@@ -437,6 +438,8 @@ active[2] proctype DeptB_Junior() {
             // Treat Mild Case (10-15 minutes)
             select(treatTime : 10..15);
             
+            timeRegistration ! SUB, _pid;
+
             do
             :: timeNotify[_pid] ? TICK -> {
                 treatTime--;
